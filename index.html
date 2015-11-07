@@ -1,0 +1,429 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <title>Sky11 by wangfakang</title>
+
+    <link rel="stylesheet" href="stylesheets/styles.css">
+    <link rel="stylesheet" href="stylesheets/github-light.css">
+    <script src="javascripts/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+  </head>
+  <body>
+    <div class="wrapper">
+      <header>
+        <h1 class="header">Sky11</h1>
+        <p class="header">tengine health check</p>
+
+        <ul>
+          <li class="download"><a class="buttons" href="https://github.com/wangfakang/sky11/zipball/master">Download ZIP</a></li>
+          <li class="download"><a class="buttons" href="https://github.com/wangfakang/sky11/tarball/master">Download TAR</a></li>
+          <li><a class="buttons github" href="https://github.com/wangfakang/sky11">View On GitHub</a></li>
+        </ul>
+
+        <p class="header">This project is maintained by <a class="header name" href="https://github.com/wangfakang">wangfakang</a></p>
+
+
+      </header>
+      <section>
+        <p><code>tengine的健康检查模块的解析：</code></p>
+
+<h1>
+<a id="基本原理" class="anchor" href="#%E5%9F%BA%E6%9C%AC%E5%8E%9F%E7%90%86" aria-hidden="true"><span class="octicon octicon-link"></span></a>基本原理：</h1>
+
+<p>　　其实基本思想都是一样定期的和后端机器进行测试连接然后进行更新相应的状态，然后都有机器选择后端的时候然后会
+判断其状态进行选取评估．<br>
+　　特点是：该模块使得每一个后端peer都携带一个自检测事件，按照其配置的interval进行测试后端然后进行修改相应的状态．
+而且同一时刻只让一个进程进行检测．其锁的粒度很小，控制在每一个后端peer的数据单元上．     </p>
+
+<div class="highlight highlight-source-nginx"><pre><span class="pl-k">http</span> {
+    <span class="pl-k">upstream</span> <span class="pl-en">bar </span>{
+        <span class="pl-k">server</span> 127.0.0.1:81;
+        <span class="pl-k">server</span> 127.0.0.1:82;
+        <span class="pl-k">check</span> interval=3000 rise=2 fall=5 timeout=1000 type=http;
+        <span class="pl-k">check_keepalive_requests</span> 100;
+        <span class="pl-k">check_http_send</span> <span class="pl-s">"HEAD / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n"</span>;
+        <span class="pl-k">check_http_expect_alive</span> http_2xx http_3xx;
+    }
+
+    <span class="pl-k">server</span> {
+        <span class="pl-k">listen</span> <span class="pl-s">80</span>;
+        <span class="pl-k">location</span> <span class="pl-en">/t</span>{
+            <span class="pl-k">proxy_pass</span> http://bar;
+        }
+
+        <span class="pl-k">location</span> <span class="pl-en">/status </span>{
+            check_status;
+            <span class="pl-k">access_log</span> <span class="pl-c1"> off</span>;
+            <span class="pl-k">allow</span> <span class="pl-s">127.0.0.1</span>;
+            <span class="pl-k">deny</span><span class="pl-c1"> all</span>;
+        }
+    }
+}</pre></div>
+
+<h1>
+<a id="相关参数的解释----" class="anchor" href="#%E7%9B%B8%E5%85%B3%E5%8F%82%E6%95%B0%E7%9A%84%E8%A7%A3%E9%87%8A----" aria-hidden="true"><span class="octicon octicon-link"></span></a>相关参数的解释：    </h1>
+
+<p>注意单位是毫秒．</p>
+
+<ul>
+<li>interval：向后端发送的健康检查包的间隔。<br>
+</li>
+<li>fall(fall_count): 如果连续失败次数达到fall_count，服务器就被认为是down。<br>
+</li>
+<li>rise(rise_count): 如果连续成功次数达到rise_count，服务器就被认为是up。<br>
+timeout: 后端健康请求的超时时间。<br>
+</li>
+<li>default_down: 设定初始时服务器的状态，如果是true，就说明默认是down的，如果是false，就是up的。其默认值是true，
+也就是一开始服务器认为是不可用，要等健康检查包达到一定成功次数以后才会被认为是健康的。<br>
+</li>
+<li>type：健康检查包的类型，如http,tcp等<br>
+</li>
+</ul>
+
+<h1>
+<a id="相关代码解析" class="anchor" href="#%E7%9B%B8%E5%85%B3%E4%BB%A3%E7%A0%81%E8%A7%A3%E6%9E%90" aria-hidden="true"><span class="octicon octicon-link"></span></a>相关代码解析：　　</h1>
+
+<p>在init_perocess阶段为每一个worker进程进行设置相应的事件定时器．其在每一个worker进程都会生效</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-c1">ngx_int_t</span>
+<span class="pl-en">ngx_http_upstream_check_add_timers</span>(<span class="pl-c1">ngx_cycle_t</span> *cycle)
+{
+    <span class="pl-c1">ngx_uint_t</span>                           i;
+    <span class="pl-c1">ngx_msec_t</span>                           t, delay;
+    <span class="pl-c1">ngx_check_conf_t</span>                    *cf;
+    <span class="pl-c1">ngx_http_upstream_check_peer_t</span>      *peer;
+    <span class="pl-c1">ngx_http_upstream_check_peers_t</span>     *peers;
+    <span class="pl-c1">ngx_http_upstream_check_srv_conf_t</span>  *ucscf;
+    <span class="pl-c1">ngx_http_upstream_check_peer_shm_t</span>  *peer_shm;
+    <span class="pl-c1">ngx_http_upstream_check_peers_shm_t</span> *peers_shm;
+
+    peers = check_peers_ctx;
+    <span class="pl-k">if</span> (peers == <span class="pl-c1">NULL</span>) {
+        <span class="pl-k">return</span> NGX_OK;
+    }
+
+    peers_shm = peers-&gt;peers_shm;
+    <span class="pl-k">if</span> (peers_shm == <span class="pl-c1">NULL</span>) {
+        <span class="pl-k">return</span> NGX_OK;
+    }
+
+    <span class="pl-c1">ngx_log_debug2</span>(NGX_LOG_DEBUG_HTTP, cycle-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                   <span class="pl-s"><span class="pl-pds">"</span>http check upstream init_process, shm_name: <span class="pl-ii">%</span>V, <span class="pl-pds">"</span></span>
+                   <span class="pl-s"><span class="pl-pds">"</span>peer number: <span class="pl-c1">%u</span>d<span class="pl-pds">"</span></span>,
+                   &amp;peers-&gt;check_shm_name,
+                   peers-&gt;peers.<span class="pl-smi">nelts</span>);
+
+    <span class="pl-c1">srandom</span>(ngx_pid);
+
+    peer = peers-&gt;peers.<span class="pl-smi">elts</span>;
+    peer_shm = peers_shm-&gt;peers;
+　　　　<span class="pl-c">//为每一个后端peer都进行设置相应的检测时间</span>
+    <span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; peers-&gt;peers.<span class="pl-smi">nelts</span>; i++) {
+        peer[i].<span class="pl-smi">shm</span> = &amp;peer_shm[i];
+
+        peer[i].<span class="pl-smi">check_ev</span>.<span class="pl-smi">handler</span> = ngx_http_upstream_check_begin_handler;
+        peer[i].<span class="pl-smi">check_ev</span>.<span class="pl-smi">log</span> = cycle-&gt;<span class="pl-c1">log</span>;
+        peer[i].<span class="pl-smi">check_ev</span>.<span class="pl-smi">data</span> = &amp;peer[i];
+        peer[i].<span class="pl-smi">check_ev</span>.<span class="pl-smi">timer_set</span> = <span class="pl-c1">0</span>;
+
+        peer[i].<span class="pl-smi">check_timeout_ev</span>.<span class="pl-smi">handler</span> =
+            ngx_http_upstream_check_timeout_handler;
+        peer[i].<span class="pl-smi">check_timeout_ev</span>.<span class="pl-smi">log</span> = cycle-&gt;<span class="pl-c1">log</span>;
+        peer[i].<span class="pl-smi">check_timeout_ev</span>.<span class="pl-smi">data</span> = &amp;peer[i];
+        peer[i].<span class="pl-smi">check_timeout_ev</span>.<span class="pl-smi">timer_set</span> = <span class="pl-c1">0</span>;
+
+        ucscf = peer[i].<span class="pl-smi">conf</span>;
+        cf = ucscf-&gt;check_type_conf;
+
+        <span class="pl-k">if</span> (cf-&gt;need_pool) {
+            peer[i].<span class="pl-smi">pool</span> = <span class="pl-c1">ngx_create_pool</span>(ngx_pagesize, cycle-&gt;<span class="pl-c1">log</span>);
+            <span class="pl-k">if</span> (peer[i].<span class="pl-smi">pool</span> == <span class="pl-c1">NULL</span>) {
+                <span class="pl-k">return</span> NGX_ERROR;
+            }
+        }
+
+        peer[i].<span class="pl-smi">send_handler</span> = cf-&gt;send_handler;
+        peer[i].<span class="pl-smi">recv_handler</span> = cf-&gt;recv_handler;
+
+        peer[i].<span class="pl-smi">init</span> = cf-&gt;init;
+        peer[i].<span class="pl-smi">parse</span> = cf-&gt;parse;
+        peer[i].<span class="pl-smi">reinit</span> = cf-&gt;reinit;
+
+        <span class="pl-c">/*</span>
+<span class="pl-c">         * We add a random start time here, since we don't want to trigger</span>
+<span class="pl-c">         * the check events too close to each other at the beginning.</span>
+<span class="pl-c">         */</span>
+        delay = ucscf-&gt;check_interval &gt; <span class="pl-c1">1000</span> ? ucscf-&gt;check_interval : <span class="pl-c1">1000</span>;
+        t = <span class="pl-c1">ngx_random</span>() % delay;
+
+        <span class="pl-c1">ngx_add_timer</span>(&amp;peer[i].<span class="pl-smi">check_ev</span>, t);
+    }
+
+    <span class="pl-k">return</span> NGX_OK;
+}</pre></div>
+
+<p>每个peer进行设置的自测连接事件</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-k">void</span>
+<span class="pl-en">ngx_http_upstream_check_begin_handler</span>(<span class="pl-c1">ngx_event_t</span> *event)
+{
+    <span class="pl-c1">ngx_msec_t</span>                           interval;
+    <span class="pl-c1">ngx_http_upstream_check_peer_t</span>      *peer;
+    <span class="pl-c1">ngx_http_upstream_check_peers_t</span>     *peers;
+    <span class="pl-c1">ngx_http_upstream_check_srv_conf_t</span>  *ucscf;
+    <span class="pl-c1">ngx_http_upstream_check_peers_shm_t</span> *peers_shm;
+
+    <span class="pl-k">if</span> (<span class="pl-c1">ngx_http_upstream_check_need_exit</span>()) {
+        <span class="pl-k">return</span>;
+    }
+
+    peers = check_peers_ctx;
+    <span class="pl-k">if</span> (peers == <span class="pl-c1">NULL</span>) {
+        <span class="pl-k">return</span>;
+    }
+
+    peers_shm = peers-&gt;peers_shm;
+    <span class="pl-k">if</span> (peers_shm == <span class="pl-c1">NULL</span>) {
+        <span class="pl-k">return</span>;
+    }
+
+    peer = event-&gt;data;
+    ucscf = peer-&gt;conf;
+　　　　<span class="pl-c">//由于定时时间一旦发生就会从注册的地方进行删除，为了下次继续定时　所以递归进行定时</span>
+    <span class="pl-c1">ngx_add_timer</span>(event, ucscf-&gt;check_interval / <span class="pl-c1">2</span>);
+
+    <span class="pl-c">/* This process is processing this peer now. */</span>
+    <span class="pl-k">if</span> (peer-&gt;shm-&gt;owner == ngx_pid ||
+        peer-&gt;check_timeout_ev.<span class="pl-smi">timer_set</span>) {
+        <span class="pl-k">return</span>;
+    }
+
+    interval = ngx_current_msec - peer-&gt;shm-&gt;access_time;
+    <span class="pl-c1">ngx_log_debug5</span>(NGX_LOG_DEBUG_HTTP, event-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                   <span class="pl-s"><span class="pl-pds">"</span>http check begin handler index: <span class="pl-c1">%u</span>i, owner: <span class="pl-ii">%</span>P, <span class="pl-pds">"</span></span>
+                   <span class="pl-s"><span class="pl-pds">"</span>ngx_pid: <span class="pl-ii">%</span>P, interval: <span class="pl-ii">%</span>M, check_interval: <span class="pl-ii">%</span>M<span class="pl-pds">"</span></span>,
+                   peer-&gt;<span class="pl-c1">index</span>, peer-&gt;shm-&gt;owner,
+                   ngx_pid, interval,
+                   ucscf-&gt;check_interval);
+　　　　<span class="pl-c">//进行抢锁，此锁是一个自旋锁</span>
+    <span class="pl-c1">ngx_shmtx_lock</span>(&amp;peer-&gt;shm-&gt;mutex);
+
+    <span class="pl-k">if</span> (peers_shm-&gt;generation != ngx_http_upstream_check_shm_generation) {
+        <span class="pl-c1">ngx_shmtx_unlock</span>(&amp;peer-&gt;shm-&gt;mutex);
+        <span class="pl-k">return</span>;
+    }
+    <span class="pl-c">//判断时间间隔</span>
+    <span class="pl-k">if</span> ((interval &gt;= ucscf-&gt;check_interval)
+         &amp;&amp; (peer-&gt;shm-&gt;owner == NGX_INVALID_PID))
+    {
+        peer-&gt;shm-&gt;owner = ngx_pid;
+
+    } <span class="pl-k">else</span> <span class="pl-k">if</span> (interval &gt;= (ucscf-&gt;check_interval &lt;&lt; <span class="pl-c1">4</span>)) {
+
+        <span class="pl-c">/*</span>
+<span class="pl-c">         * If the check peer has been untouched for 2^4 times of</span>
+<span class="pl-c">         * the check interval, activate the current timer.</span>
+<span class="pl-c">         * Sometimes, the checking process may disappear</span>
+<span class="pl-c">         * in some circumstances, and the clean event will never</span>
+<span class="pl-c">         * be triggered.</span>
+<span class="pl-c">         */</span>
+        peer-&gt;shm-&gt;owner = ngx_pid;
+        peer-&gt;shm-&gt;access_time = ngx_current_msec;
+    }
+
+    <span class="pl-c1">ngx_shmtx_unlock</span>(&amp;peer-&gt;shm-&gt;mutex);
+　　　　<span class="pl-c">//只让当前抢到锁的进程进行连接处理后端</span>
+    <span class="pl-k">if</span> (peer-&gt;shm-&gt;owner == ngx_pid) {
+        <span class="pl-c1">ngx_http_upstream_check_connect_handler</span>(event);
+    }
+}</pre></div>
+
+<p>进行测试连接后端</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-k">void</span>
+<span class="pl-en">ngx_http_upstream_check_connect_handler</span>(<span class="pl-c1">ngx_event_t</span> *event)
+{
+    <span class="pl-c1">ngx_int_t</span>                            rc;
+    <span class="pl-c1">ngx_connection_t</span>                    *c;
+    <span class="pl-c1">ngx_http_upstream_check_peer_t</span>      *peer;
+    <span class="pl-c1">ngx_http_upstream_check_srv_conf_t</span>  *ucscf;
+　　　　<span class="pl-c">//判断当是不是要结束进程</span>
+    <span class="pl-k">if</span> (<span class="pl-c1">ngx_http_upstream_check_need_exit</span>()) {
+        <span class="pl-k">return</span>;
+    }
+
+    peer = event-&gt;data;
+    ucscf = peer-&gt;conf;
+　　　　<span class="pl-c">//判断其连接是不是空空</span>
+    <span class="pl-k">if</span> (peer-&gt;pc.<span class="pl-smi">connection</span> != <span class="pl-c1">NULL</span>) {
+        c = peer-&gt;pc.<span class="pl-smi">connection</span>;
+　　　　　　　　<span class="pl-c">//测试该连接是否还可以复用　可以复用</span>
+        <span class="pl-k">if</span> ((rc = <span class="pl-c1">ngx_http_upstream_check_peek_one_byte</span>(c)) == NGX_OK) {
+            <span class="pl-k">goto</span> upstream_check_connect_done;
+        } <span class="pl-k">else</span> {
+            <span class="pl-c1">ngx_close_connection</span>(c);
+            peer-&gt;pc.<span class="pl-smi">connection</span> = <span class="pl-c1">NULL</span>;
+        }
+    }
+    <span class="pl-c1">ngx_memzero</span>(&amp;peer-&gt;pc, <span class="pl-k">sizeof</span>(<span class="pl-c1">ngx_peer_connection_t</span>));
+
+    peer-&gt;pc.<span class="pl-smi">sockaddr</span> = peer-&gt;check_peer_addr-&gt;sockaddr;
+    peer-&gt;pc.<span class="pl-smi">socklen</span> = peer-&gt;check_peer_addr-&gt;socklen;
+    peer-&gt;pc.<span class="pl-smi">name</span> = &amp;peer-&gt;check_peer_addr-&gt;name;
+
+    peer-&gt;pc.<span class="pl-smi">get</span> = ngx_event_get_peer;
+    peer-&gt;pc.<span class="pl-smi">log</span> = event-&gt;<span class="pl-c1">log</span>;
+    peer-&gt;pc.<span class="pl-smi">log_error</span> = NGX_ERROR_ERR;
+
+    peer-&gt;pc.<span class="pl-smi">cached</span> = <span class="pl-c1">0</span>;
+    peer-&gt;pc.<span class="pl-smi">connection</span> = <span class="pl-c1">NULL</span>;
+　　　　<span class="pl-c">//若该连接已经断开了　则进行重新进行连接</span>
+    rc = <span class="pl-c1">ngx_event_connect_peer</span>(&amp;peer-&gt;pc);
+
+    <span class="pl-k">if</span> (rc == NGX_ERROR || rc == NGX_DECLINED) {
+        <span class="pl-c1">ngx_http_upstream_check_status_update</span>(peer, <span class="pl-c1">0</span>);
+        <span class="pl-k">return</span>;
+    }
+
+    <span class="pl-c">/* NGX_OK or NGX_AGAIN */</span>
+    c = peer-&gt;pc.<span class="pl-smi">connection</span>;
+    c-&gt;data = peer;
+    c-&gt;<span class="pl-c1">log</span> = peer-&gt;pc.<span class="pl-smi">log</span>;
+    c-&gt;sendfile = <span class="pl-c1">0</span>;
+    c-&gt;<span class="pl-c1">read</span>-&gt;<span class="pl-c1">log</span> = c-&gt;<span class="pl-c1">log</span>;
+    c-&gt;<span class="pl-c1">write</span>-&gt;<span class="pl-c1">log</span> = c-&gt;<span class="pl-c1">log</span>;
+    c-&gt;pool = peer-&gt;pool;
+
+upstream_check_connect_done:
+    peer-&gt;state = NGX_HTTP_CHECK_CONNECT_DONE;
+
+    c-&gt;<span class="pl-c1">write</span>-&gt;handler = peer-&gt;send_handler;
+    c-&gt;<span class="pl-c1">read</span>-&gt;handler = peer-&gt;recv_handler;
+
+    <span class="pl-c1">ngx_add_timer</span>(&amp;peer-&gt;check_timeout_ev, ucscf-&gt;check_timeout);
+
+    <span class="pl-c">/* The kqueue's loop interface needs it. */</span>
+    <span class="pl-k">if</span> (rc == NGX_OK) {
+        c-&gt;<span class="pl-c1">write</span>-&gt;<span class="pl-c1">handler</span>(c-&gt;<span class="pl-c1">write</span>);
+    }
+} peer-&gt;pc.log_error = NGX_ERROR_ERR;
+
+    peer-&gt;pc.cached = <span class="pl-c1">0</span>;
+    peer-&gt;pc.connection = <span class="pl-c1">NULL</span>;
+
+    rc = ngx_event_connect_peer(&amp;peer-&gt;pc);
+　　　　<span class="pl-c">//进行相应状态的更新</span>
+    <span class="pl-k">if</span> (rc == NGX_ERROR || rc == NGX_DECLINED) {
+        <span class="pl-c1">ngx_http_upstream_check_status_update</span>(peer, <span class="pl-c1">0</span>);
+        <span class="pl-k">return</span>;
+    }
+
+    <span class="pl-c">/* NGX_OK or NGX_AGAIN */</span>
+    c = peer-&gt;pc.connection;
+    c-&gt;data = peer;
+    c-&gt;log = peer-&gt;pc.log;
+    c-&gt;sendfile = <span class="pl-c1">0</span>;
+    c-&gt;read-&gt;log = c-&gt;log;
+    c-&gt;write-&gt;log = c-&gt;log;
+    c-&gt;pool = peer-&gt;pool;
+
+upstream_check_connect_done:
+    peer-&gt;state = NGX_HTTP_CHECK_CONNECT_DONE;
+
+    c-&gt;write-&gt;handler = peer-&gt;send_handler;
+    c-&gt;read-&gt;handler = peer-&gt;recv_handler;
+
+    <span class="pl-en">ngx_add_timer</span>(&amp;peer-&gt;check_timeout_ev, ucscf-&gt;check_timeout);
+
+    <span class="pl-c">/* The kqueue's loop interface needs it. */</span>
+    <span class="pl-k">if</span> (rc == NGX_OK) {
+        c-&gt;<span class="pl-c1">write</span>-&gt;<span class="pl-c1">handler</span>(c-&gt;<span class="pl-c1">write</span>);
+    }
+}</pre></div>
+
+<p>相应后端peer的状态的更新</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-k">void</span>
+<span class="pl-en">ngx_http_upstream_check_status_update</span>(<span class="pl-c1">ngx_http_upstream_check_peer_t</span> *peer,
+    <span class="pl-c1">ngx_int_t</span> result)
+{
+    <span class="pl-c1">ngx_http_upstream_check_srv_conf_t</span>  *ucscf;
+
+    ucscf = peer-&gt;conf;
+　　　　<span class="pl-c">//后端peer连接成功</span>
+    <span class="pl-k">if</span> (result) {
+        peer-&gt;shm-&gt;rise_count++;
+        peer-&gt;shm-&gt;fall_count = <span class="pl-c1">0</span>;
+　　　　    <span class="pl-c">//统计累计连续成功的次数　根据配置的rise进行peer的更新</span>
+        <span class="pl-k">if</span> (peer-&gt;shm-&gt;down &amp;&amp; peer-&gt;shm-&gt;rise_count &gt;= ucscf-&gt;rise_count) {
+            peer-&gt;shm-&gt;down = <span class="pl-c1">0</span>;
+            <span class="pl-c1">ngx_log_error</span>(NGX_LOG_ERR, ngx_cycle-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                          <span class="pl-s"><span class="pl-pds">"</span>enable check peer: <span class="pl-ii">%</span>V <span class="pl-pds">"</span></span>,
+                          &amp;peer-&gt;check_peer_addr-&gt;name);
+        }
+    } <span class="pl-k">else</span> {
+        <span class="pl-c">//和上面相反操作</span>
+        peer-&gt;shm-&gt;rise_count = <span class="pl-c1">0</span>;
+        peer-&gt;shm-&gt;fall_count++;
+        <span class="pl-k">if</span> (!peer-&gt;shm-&gt;down &amp;&amp; peer-&gt;shm-&gt;fall_count &gt;= ucscf-&gt;fall_count) {
+            peer-&gt;shm-&gt;down = <span class="pl-c1">1</span>;
+            <span class="pl-c1">ngx_log_error</span>(NGX_LOG_ERR, ngx_cycle-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
+                          <span class="pl-s"><span class="pl-pds">"</span>disable check peer: <span class="pl-ii">%</span>V <span class="pl-pds">"</span></span>,
+                          &amp;peer-&gt;check_peer_addr-&gt;name);
+        }
+    }
+
+    peer-&gt;shm-&gt;access_time = ngx_current_msec;
+}</pre></div>
+
+<h1>
+<a id="欢迎一起交流学习-" class="anchor" href="#%E6%AC%A2%E8%BF%8E%E4%B8%80%E8%B5%B7%E4%BA%A4%E6%B5%81%E5%AD%A6%E4%B9%A0-" aria-hidden="true"><span class="octicon octicon-link"></span></a>欢迎一起交流学习 </h1>
+
+<p>在使用中有任何问题，欢迎反馈给我，可以用以下联系方式跟我交流</p>
+
+<ul>
+<li>邮件(1031379296#qq.com, 把#换成@)</li>
+<li>QQ: 1031379296</li>
+<li>weibo: <a href="http://weibo.com/u/2786211992/home">@王发康</a>
+</li>
+</ul>
+
+<h1>
+<a id="thx" class="anchor" href="#thx" aria-hidden="true"><span class="octicon octicon-link"></span></a>Thx</h1>
+
+<ul>
+<li>chunshengsterATgmail.com</li>
+</ul>
+
+<h1>
+<a id="author" class="anchor" href="#author" aria-hidden="true"><span class="octicon octicon-link"></span></a>Author</h1>
+
+<ul>
+<li>Linux\nginx\golang\c\c++爱好者</li>
+<li>欢迎一起交流  一起学习# </li>
+<li>Others say good and Others good</li>
+</ul>
+      </section>
+      <footer>
+        <p><small>Hosted on <a href="https://pages.github.com">GitHub Pages</a> using the Dinky theme</small></p>
+      </footer>
+    </div>
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+		          <script type="text/javascript">
+            var gaJsHost = (("https:" == document.location.protocol) ? "https://ssl." : "http://www.");
+            document.write(unescape("%3Cscript src='" + gaJsHost + "google-analytics.com/ga.js' type='text/javascript'%3E%3C/script%3E"));
+          </script>
+          <script type="text/javascript">
+            try {
+              var pageTracker = _gat._getTracker("tengine health check 健康健康模块的分析");
+            pageTracker._trackPageview();
+            } catch(err) {}
+          </script>
+
+  </body>
+</html>
